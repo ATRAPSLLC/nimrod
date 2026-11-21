@@ -11,15 +11,23 @@
 //! On top of the per-version readers, three extraction passes recover data the
 //! readers expose only as raw addresses:
 //!
-//! - **V2 inheritance** — the `display` class-token array (`RESEARCH.md` §3.2)
+//! - **V2 inheritance**: the `display` class-token array (`RESEARCH.md` §3.2)
 //!   is dereferenced into [`NimType::display_tokens`], and V2 parents are
 //!   linked through it.
-//! - **V1 enum values** — for enum types the `TNimNode` slots are reinterpreted
+//! - **V1 enum values**: for enum types the `TNimNode` slots are reinterpreted
 //!   as [`EnumValue`]s (each slot's `offset` is the enumerator ordinal).
-//! - **V2 → V1 bridge** — when a V2 type carries a non-nil `typeInfoV1`
+//! - **V2 → V1 bridge**: when a V2 type carries a non-nil `typeInfoV1`
 //!   backpointer, the legacy record it points at is read and its field names
 //!   are imported (the only way to recover member names for ARC/ORC objects
 //!   that were not compiled with `nimTypeNames`).
+//!
+//! Legacy RTTI, and V2 RTTI before Nim 2.0, is zero in the file and filled at
+//! startup by each module's `DatInit000`. When the file leaves any type
+//! unreadable, [`build`] evaluates those functions (x86-64 and AArch64, see
+//! `emu`) and builds the graph again from the image with their writes
+//! applied. The legacy struct layout is detected per binary
+//! ([`rtti::v1::detect_layout`]). A [`CodeRef`] read from such a write is
+//! marked [`CodeRef::emulated`]: the pointer is not in the file.
 //!
 //! All types here are **owned** (no lifetime parameter): the graph outlives the
 //! borrow of the input bytes, so [`crate::NimBinary`] can cache it in a
@@ -29,7 +37,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     container::Container,
-    demangle::symbol,
+    emu,
     rtti::{
         self,
         symbols::RttiVersion,
@@ -108,13 +116,13 @@ impl core::fmt::Display for TypeShape {
 /// reference cycle).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct TypeFlags {
-    /// `ntfNoRefs` — the type contains no `ref` / `seq` / `string` members.
+    /// `ntfNoRefs`: the type contains no `ref` / `seq` / `string` members.
     /// V1 only; always `false` for V2 (the V2 flag word does not encode it).
     pub no_refs: bool,
     /// The type cannot form a reference cycle (`ntfAcyclic` for V1, `flags & 1`
     /// for V2).
     pub acyclic: bool,
-    /// `ntfEnumHole` — an enum with non-contiguous ordinals; `$` needs the slow
+    /// `ntfEnumHole`: an enum with non-contiguous ordinals; `$` needs the slow
     /// path. V1 only.
     pub enum_hole: bool,
 }
@@ -132,6 +140,92 @@ pub struct TypeRef {
     pub name: Option<String>,
 }
 
+/// A proc the Nim runtime calls on behalf of a type, rather than through a
+/// direct call: a lifetime-tracking hook (`=destroy`, `=copy`, ...), a GC
+/// marker or trace proc, or a finalizer.
+///
+/// The RTTI slots carry [`Destroy`](HookKind::Destroy) and
+/// [`Trace`](HookKind::Trace) (V2), and [`Marker`](HookKind::Marker),
+/// [`DeepCopy`](HookKind::DeepCopy) and [`Finalizer`](HookKind::Finalizer)
+/// (V1). The other kinds are known only from the proc's name.
+///
+/// # Stability
+///
+/// The string returned by [`as_str`](HookKind::as_str) /
+/// [`Display`](core::fmt::Display) is part of nimrod's stable API. Changes are
+/// SemVer-major.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum HookKind {
+    /// `=destroy`: the destructor (V2 RTTI `destructor`).
+    Destroy,
+    /// `=copy`: the assignment hook.
+    Copy,
+    /// `=sink`: the move-assignment hook.
+    Sink,
+    /// `=trace`: the cycle-collector trace proc (V2 RTTI `traceImpl`).
+    Trace,
+    /// `=wasMoved`: resets a moved-from location.
+    WasMoved,
+    /// `=dup`: the duplication hook (Nim 2.0+).
+    Dup,
+    /// `=dispose`: frees a cyclic object (Nim 1.4 ORC only).
+    Dispose,
+    /// `=deepCopy`: the `deepCopy` hook (V1 RTTI `deepcopy`).
+    DeepCopy,
+    /// The refc GC marker (`Marker_*`, V1 RTTI `marker`).
+    Marker,
+    /// A finalizer registered with `new(x, finalizer)` (V1 RTTI `finalizer`).
+    Finalizer,
+}
+
+impl HookKind {
+    /// Returns the stable string identifier for this kind.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Destroy => "Destroy",
+            Self::Copy => "Copy",
+            Self::Sink => "Sink",
+            Self::Trace => "Trace",
+            Self::WasMoved => "WasMoved",
+            Self::Dup => "Dup",
+            Self::Dispose => "Dispose",
+            Self::DeepCopy => "DeepCopy",
+            Self::Marker => "Marker",
+            Self::Finalizer => "Finalizer",
+        }
+    }
+
+    /// The kind of a lifetime-tracking hook from its demangled identifier
+    /// (`=destroy`, `=copy`, `=sink`, `=trace`, `=wasMoved`, `=dup`,
+    /// `=dispose`, `=deepCopy`), as `compiler/liftdestructors.nim` names
+    /// them.
+    ///
+    /// Releases before 2.0 spell some hooks in lower case (`=wasmoved`,
+    /// `=deepcopy`), and identifiers are matched without regard to case.
+    pub fn from_identifier(identifier: &str) -> Option<Self> {
+        let hook = identifier.strip_prefix('=')?;
+        [
+            ("destroy", Self::Destroy),
+            ("copy", Self::Copy),
+            ("sink", Self::Sink),
+            ("trace", Self::Trace),
+            ("wasMoved", Self::WasMoved),
+            ("dup", Self::Dup),
+            ("dispose", Self::Dispose),
+            ("deepCopy", Self::DeepCopy),
+        ]
+        .into_iter()
+        .find(|(name, _)| hook.eq_ignore_ascii_case(name))
+        .map(|(_, kind)| kind)
+    }
+}
+
+impl core::fmt::Display for HookKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A reference from a type to a code address (destructor, finalizer, marker,
 /// deepcopy, or trace proc), resolved to a function symbol when possible.
 #[derive(Debug, Clone)]
@@ -145,6 +239,9 @@ pub struct CodeRef {
     pub module: Option<String>,
     /// Raw (mangled) symbol name covering `address`, when one was found.
     pub symbol_name: Option<String>,
+    /// Whether the pointer was written at startup by a `DatInit000` function
+    /// (recovered by evaluating it) rather than stored in the file.
+    pub emulated: bool,
 }
 
 /// A member field of an object or tuple type.
@@ -183,8 +280,8 @@ pub struct EnumValue {
 ///
 /// When the RTTI struct's bytes are not file-backed (notably V1 globals that
 /// land in Mach-O `__DATA,__common`, `RESEARCH.md` §3.6), the struct cannot be
-/// parsed from the file. The entry is still returned — `symbol_name`,
-/// `address`, `version`, and the V1 `type_fragment` carry forensic value — but
+/// parsed from the file. The entry is still returned - `symbol_name`,
+/// `address`, `version`, and the V1 `type_fragment` carry forensic value - but
 /// the parsed fields default to empty and [`shape`](NimType::shape) is
 /// [`TypeShape::Other`]. Use [`NimType::is_readable`] to distinguish.
 #[derive(Debug, Clone)]
@@ -202,6 +299,12 @@ pub struct NimType {
     /// V1 readable type fragment decoded from the `NTI<typespec><hash>_` symbol
     /// name (`RESEARCH.md` §3.4). Always `None` for V2.
     pub type_fragment: Option<String>,
+    /// [`NimType::type_fragment`] decoded back into a Nim type expression
+    /// (`seqLintT` -> `seq[int]`, `int5150` -> `int32`); see
+    /// [`crate::rtti::symbols::decode_type_fragment`]. Letter case and
+    /// spaces are not recoverable. Always `None` for V2, and for Nim 1.0 -
+    /// 1.4, whose V1 RTTI globals are named `NTI__<hash>_` with no type part.
+    pub type_expr: Option<String>,
     /// Coarse classification.
     pub shape: TypeShape,
     /// Size of the type in bytes (`0` when the struct was unreadable).
@@ -247,10 +350,60 @@ pub struct NimType {
 impl NimType {
     /// Returns `true` if the RTTI struct bytes were file-backed and parsed.
     ///
-    /// `false` indicates a name-only shell — the symbol existed but its struct
+    /// `false` indicates a name-only shell - the symbol existed but its struct
     /// data was not in the file (e.g. Mach-O `__DATA,__common`).
     pub fn is_readable(&self) -> bool {
         self.readable
+    }
+
+    /// The type's non-nil hook slots with their kind: the V2
+    /// [`destructor`](NimType::destructor) and
+    /// [`trace_impl`](NimType::trace_impl), the V1
+    /// [`finalizer`](NimType::finalizer), [`marker`](NimType::marker) and
+    /// [`deepcopy`](NimType::deepcopy).
+    pub fn hooks(&self) -> impl Iterator<Item = (HookKind, &CodeRef)> {
+        [
+            (HookKind::Destroy, &self.destructor),
+            (HookKind::Trace, &self.trace_impl),
+            (HookKind::Finalizer, &self.finalizer),
+            (HookKind::Marker, &self.marker),
+            (HookKind::DeepCopy, &self.deepcopy),
+        ]
+        .into_iter()
+        .filter_map(|(kind, slot)| slot.as_ref().map(|r| (kind, r)))
+    }
+}
+
+#[cfg(test)]
+impl NimType {
+    /// A readable V2 type at `address` with nothing else set, for unit tests
+    /// of the passes built on the type graph.
+    pub fn synthetic(address: u64) -> Self {
+        NimType {
+            version: RttiVersion::V2,
+            symbol_name: "NTIv2__x_".into(),
+            address,
+            name: None,
+            type_fragment: None,
+            type_expr: None,
+            shape: TypeShape::Other,
+            size: 0,
+            align: 0,
+            depth: None,
+            flags: TypeFlags::default(),
+            kind: None,
+            parent: None,
+            fields: Vec::new(),
+            enum_values: Vec::new(),
+            display_tokens: Vec::new(),
+            destructor: None,
+            trace_impl: None,
+            finalizer: None,
+            marker: None,
+            deepcopy: None,
+            type_info_v1: None,
+            readable: true,
+        }
     }
 }
 
@@ -260,9 +413,55 @@ impl NimType {
 /// [`rtti::symbols::scan`]. The result is deterministic (symbols are processed
 /// in scan order; internal indices use [`BTreeMap`]).
 pub fn build(container: &Container<'_>) -> Vec<NimType> {
-    // Step 1 — seed one NimType per RTTI symbol. This fixes every type's
+    let types = type_graph(container);
+    if types.iter().all(|t| t.readable) {
+        return types;
+    }
+    // Objects the file leaves zero (`.bss`) are filled by the `DatInit000`
+    // functions at startup: evaluate them and read the result instead.
+    let overlay = emu::evaluate_datinits(container, emu::TOTAL_STEP_BUDGET);
+    if overlay.is_empty() {
+        return types;
+    }
+    let patched = emu::Patched::new(container, &overlay);
+    let mut evaluated = type_graph(&patched.container(container));
+    // A pointer the file did not hold came from the evaluated writes. Both
+    // passes see the same RTTI symbols, so types pair up by address.
+    let plain: BTreeMap<u64, &NimType> = types.iter().map(|t| (t.address, t)).collect();
+    for t in &mut evaluated {
+        let before = plain.get(&t.address);
+        for (slot, field) in [
+            (
+                &mut t.destructor,
+                before.and_then(|p| p.destructor.as_ref()),
+            ),
+            (
+                &mut t.trace_impl,
+                before.and_then(|p| p.trace_impl.as_ref()),
+            ),
+            (&mut t.finalizer, before.and_then(|p| p.finalizer.as_ref())),
+            (&mut t.marker, before.and_then(|p| p.marker.as_ref())),
+            (&mut t.deepcopy, before.and_then(|p| p.deepcopy.as_ref())),
+        ] {
+            if let Some(r) = slot {
+                r.emulated = field.map(|f| f.address) != Some(r.address);
+            }
+        }
+    }
+    evaluated
+}
+
+/// Builds the type graph from the image bytes as given.
+fn type_graph(container: &Container<'_>) -> Vec<NimType> {
+    // Step 1: seed one NimType per RTTI symbol. This fixes every type's
     // address, which is all that the VA index in step 2 needs.
     let rtti_syms = rtti::symbols::scan(container);
+    let v1_vas: Vec<u64> = rtti_syms
+        .iter()
+        .filter(|s| s.version == RttiVersion::V1)
+        .map(|s| s.address)
+        .collect();
+    let v1_layout = rtti::v1::detect_layout(container, &v1_vas);
     let mut types: Vec<NimType> = rtti_syms
         .iter()
         .map(|s| NimType {
@@ -271,6 +470,10 @@ pub fn build(container: &Container<'_>) -> Vec<NimType> {
             address: s.address,
             name: None,
             type_fragment: s.type_fragment.clone(),
+            type_expr: s
+                .type_fragment
+                .as_deref()
+                .map(rtti::symbols::decode_type_fragment),
             shape: TypeShape::Other,
             size: 0,
             align: 0,
@@ -291,7 +494,7 @@ pub fn build(container: &Container<'_>) -> Vec<NimType> {
         })
         .collect();
 
-    // Step 2 — VA → type-index map. Built from addresses alone, so it is
+    // Step 2: VA → type-index map. Built from addresses alone, so it is
     // complete before any struct is read and can resolve forward references.
     let va_index: BTreeMap<u64, usize> = types
         .iter()
@@ -299,7 +502,7 @@ pub fn build(container: &Container<'_>) -> Vec<NimType> {
         .map(|(i, t)| (t.address, i))
         .collect();
 
-    // Step 3 — parse each struct and resolve its cross-references. The
+    // Step 3: parse each struct and resolve its cross-references. The
     // `display`/`typeInfoV1` addresses are stashed for passes a and c.
     let mut display_info: Vec<Option<(u64, i16)>> = vec![None; types.len()];
 
@@ -332,12 +535,24 @@ pub fn build(container: &Container<'_>) -> Vec<NimType> {
                 }
             }
             RttiVersion::V1 => {
-                let Some(f) = rtti::v1::read(container, t.address) else {
+                let Some(f) = rtti::v1::read(container, t.address, v1_layout)
+                    .filter(rtti::v1::TNimTypeFields::is_plausible)
+                else {
                     continue;
                 };
                 t.readable = true;
                 t.size = f.size;
                 t.align = f.align;
+                if v1_layout == rtti::v1::V1Layout::Nim12Arc {
+                    // Nim 1.2 ARC: size, name and hooks only.
+                    t.name = f.name;
+                    if t.name.is_some() {
+                        t.shape = TypeShape::Object;
+                    }
+                    t.destructor = f.destructor_addr.map(|a| resolve_code_ref(container, a));
+                    t.trace_impl = f.trace_addr.map(|a| resolve_code_ref(container, a));
+                    continue;
+                }
                 t.kind = Some(f.kind);
                 t.name = f.name;
                 t.shape = TypeShape::from_kind(f.kind);
@@ -347,7 +562,7 @@ pub fn build(container: &Container<'_>) -> Vec<NimType> {
                 t.marker = f.marker_addr.map(|a| resolve_code_ref(container, a));
                 t.deepcopy = f.deepcopy_addr.map(|a| resolve_code_ref(container, a));
 
-                // Pass b — enum slots encode (name, ordinal); everything else
+                // Pass b: enum slots encode (name, ordinal); everything else
                 // is a struct field.
                 if f.kind == NimKind::Enum {
                     t.enum_values = node_fields_to_enum_values(&f.node_fields);
@@ -358,7 +573,7 @@ pub fn build(container: &Container<'_>) -> Vec<NimType> {
         }
     }
 
-    // Pass a — dereference each V2 `display` array into class tokens, then link
+    // Pass a: dereference each V2 `display` array into class tokens, then link
     // V2 parents through them. Two sub-passes because the token→index map needs
     // every type's own token first.
     let mut token_index: BTreeMap<u32, usize> = BTreeMap::new();
@@ -394,7 +609,7 @@ pub fn build(container: &Container<'_>) -> Vec<NimType> {
         }
     }
 
-    // Pass c — V2 → V1 field bridge. When a V2 object carries a non-nil
+    // Pass c: V2 → V1 field bridge. When a V2 object carries a non-nil
     // typeInfoV1 backpointer, import the legacy record's member names (the only
     // route to field names for ARC/ORC objects without `nimTypeNames`).
     let bridge_targets: Vec<(usize, u64)> = types
@@ -409,7 +624,7 @@ pub fn build(container: &Container<'_>) -> Vec<NimType> {
         })
         .collect();
     for (i, v1_addr) in bridge_targets {
-        let Some(f) = rtti::v1::read(container, v1_addr) else {
+        let Some(f) = rtti::v1::read(container, v1_addr, v1_layout) else {
             continue;
         };
         if f.node_fields.is_empty() {
@@ -421,9 +636,12 @@ pub fn build(container: &Container<'_>) -> Vec<NimType> {
         }
     }
 
-    // Final pass — back-fill every TypeRef's resolved name. Snapshot the names
+    // Final pass: back-fill every TypeRef's resolved name. Snapshot the names
     // first so we can read and write `types` without aliasing.
-    let names: Vec<Option<String>> = types.iter().map(|t| t.name.clone()).collect();
+    let names: Vec<Option<String>> = types
+        .iter()
+        .map(|t| t.name.clone().or_else(|| t.type_expr.clone()))
+        .collect();
     for t in types.iter_mut() {
         backfill_ref(&mut t.parent, &names);
         backfill_ref(&mut t.type_info_v1, &names);
@@ -464,17 +682,19 @@ fn resolve_code_ref(container: &Container<'_>, addr: u64) -> CodeRef {
             function: None,
             module: None,
             symbol_name: None,
+            emulated: false,
         };
     };
     let raw = sym.name.as_ref();
-    let demangled = symbol::parse(raw);
+    let demangled = container.demangle(raw);
     CodeRef {
         address: addr,
         function: demangled
             .as_ref()
             .map(|d| d.identifier.clone().into_owned()),
-        module: demangled.as_ref().map(|d| d.module.to_owned()),
+        module: demangled.as_ref().and_then(|d| d.module).map(str::to_owned),
         symbol_name: Some(raw.to_owned()),
+        emulated: false,
     }
 }
 
@@ -527,10 +747,11 @@ fn read_display_tokens(container: &Container<'_>, display_addr: u64, depth: i16)
     };
     let count = depth_usize.saturating_add(1).min(MAX_DEPTH);
 
-    let Some(base_off) = rtti::v2::va_to_offset(container, display_addr) else {
+    let Some(base_off) = util::va_to_offset(container, display_addr) else {
         return Vec::new();
     };
     let bytes = container.bytes();
+    let words = util::DataLayout::of(container);
 
     let mut tokens = Vec::with_capacity(count);
     for i in 0..count {
@@ -542,7 +763,7 @@ fn read_display_tokens(container: &Container<'_>, display_addr: u64, depth: i16)
         if off.checked_add(4).is_none_or(|end| end > bytes.len()) {
             break;
         }
-        tokens.push(util::read_u32_le(bytes, off));
+        tokens.push(words.u32(bytes, off));
     }
     tokens
 }
@@ -642,7 +863,7 @@ mod tests {
     // recovers members, offsets, and ordinals through the real reader.
     // ---------------------------------------------------------------------
 
-    use crate::container::{self, Arch, Format, Section, SectionKind, Symbol, SymbolKind};
+    use crate::container::{Arch, Container, Format, Section, SectionKind, Symbol, SymbolKind};
     use std::borrow::Cow;
 
     fn w64(buf: &mut [u8], off: usize, val: u64) {
@@ -738,7 +959,7 @@ mod tests {
             },
         ];
         let container =
-            container::assemble(&bytes, Format::Elf, Arch::Amd64, 0, vec![section], symbols);
+            Container::from_parts(&bytes, Format::Elf, Arch::Amd64, 0, vec![section], symbols);
 
         let types = build(&container);
         assert_eq!(types.len(), 2);

@@ -20,11 +20,11 @@ use core::fmt;
 /// stable API. Changes are SemVer-major.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InitKind {
-    /// `*Init000` — runtime module initialisation.
+    /// `*Init000`: runtime module initialisation.
     Init,
-    /// `*DatInit000` — data-segment initialisation.
+    /// `*DatInit000`: data-segment initialisation.
     DatInit,
-    /// `*HcrInit000` — hot-code-reload initialisation.
+    /// `*HcrInit000`: hot-code-reload initialisation.
     HcrInit,
 }
 
@@ -80,7 +80,7 @@ pub fn scan(container: &Container<'_>) -> Vec<InitFunction> {
         for &(suffix, kind) in INIT_SUFFIXES {
             if let Some(module_part) = name.strip_suffix(suffix) {
                 // Skip the main-module shim `NimMainModule` and prefixed
-                // variants (`<prefix>NimMainModule`) — those are entry
+                // variants (`<prefix>NimMainModule`): those are entry
                 // shims, not module init functions.
                 if module_part.is_empty() || module_part.ends_with("NimMain") {
                     continue;

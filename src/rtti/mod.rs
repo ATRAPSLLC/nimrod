@@ -6,7 +6,8 @@
 //! - [`symbols::scan`] enumerates `NTIv2_` and `NTI_` globals from the
 //!   symbol table.
 //! - [`v2::read`] parses a `TNimTypeV2` struct at a given address.
-//! - [`v1::read`] does best-effort parsing of a legacy `TNimType`.
+//! - [`v1::read`] does best-effort parsing of a legacy `TNimType` under a
+//!   layout from [`v1::detect_layout`].
 
 pub mod symbols;
 pub mod v1;

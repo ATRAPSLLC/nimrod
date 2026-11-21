@@ -1,3 +1,8 @@
+//! Fuzzes the demanglers on arbitrary UTF-8: identifier demangling and
+//! mangling (and their round trip), symbol parsing under both tie-breaks,
+//! the per-table layout vote, and module-path decoding. Run with
+//! `cargo fuzz run demangle`.
+
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -10,7 +15,9 @@ fuzz_target!(|data: &[u8]| {
 
     let _ = identifier::demangle(s);
     let _ = identifier::mangle(s);
-    let _ = symbol::parse(s);
+    let _ = symbol::parse(s, None);
+    let _ = symbol::parse(s, Some(symbol::MangleScheme::Nim24));
+    let _ = symbol::dominant_scheme(s.split(' '));
     let _ = modpath::decode(s);
 
     // Round-trip: mangle then demangle should not panic.

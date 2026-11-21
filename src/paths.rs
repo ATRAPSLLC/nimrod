@@ -21,7 +21,7 @@ pub struct NimblePath {
     pub pkg_name: Option<String>,
     /// Package version (e.g. `0.1.1`).
     pub pkg_version: Option<String>,
-    /// Package hash — typically a git commit hash (pkgs2 layout only).
+    /// Package hash: typically a git commit hash (pkgs2 layout only).
     pub pkg_hash: Option<String>,
 }
 
@@ -73,6 +73,8 @@ pub fn scan(container: &Container<'_>) -> Vec<NimblePath> {
     results
 }
 
+/// Adds every distinct cstring of `data` that contains `.nimble/pkgs` to
+/// `out` (`seen` spans all sections).
 fn scan_section(
     data: &[u8],
     out: &mut Vec<NimblePath>,
@@ -107,6 +109,8 @@ fn scan_section(
     }
 }
 
+/// The start of the printable-ASCII run that contains `pos`: the offset after
+/// the nearest NUL or non-printable byte before it.
 fn walk_back_to_string_start(data: &[u8], pos: usize) -> usize {
     // Walk backwards from `pos` looking for a NUL or non-printable byte.
     let mut i = pos;
@@ -115,7 +119,7 @@ fn walk_back_to_string_start(data: &[u8], pos: usize) -> usize {
         let Some(&b) = data.get(prev) else {
             return i;
         };
-        if b == 0 || !(0x20..=0x7E).contains(&b) {
+        if !crate::util::is_printable_ascii(b) {
             return i;
         }
         i = prev;
@@ -123,6 +127,8 @@ fn walk_back_to_string_start(data: &[u8], pos: usize) -> usize {
     0
 }
 
+/// Splits a leaked nimble path into its OS style (drive letter or leading
+/// `/`), user name, and package name, version and checksum.
 fn parse_nimble_path(raw: &str) -> NimblePath {
     let os_hint = if raw.len() >= 3 && raw.as_bytes().get(1).copied() == Some(b':') {
         PathOs::Windows

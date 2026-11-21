@@ -26,13 +26,13 @@ pub struct ModulePath {
 /// The prefix token in a Nim module path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathPrefix {
-    /// `@m` — module (direct source file).
+    /// `@m`: module (direct source file).
     Module,
-    /// `@p` — package / stdlib path.
+    /// `@p`: package / stdlib path.
     Package,
-    /// `@d` — directory-level marker.
+    /// `@d`: directory-level marker.
     Directory,
-    /// `@h` — higher-level directory.
+    /// `@h`: higher-level directory.
     Higher,
 }
 

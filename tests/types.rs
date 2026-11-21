@@ -1,8 +1,8 @@
-//! Integration tests for the v0.3.0 type-graph, code-entrypoint, and
-//! compiler-version surfaces.
+//! Integration tests for the type graph, code entrypoints and compiler
+//! version.
 //!
-//! Fixtures live under `tests/fixtures/` (see `tests/integration.rs` for how
-//! they are produced). Every test skips gracefully when its fixture is absent.
+//! Fixtures are described in `tests/common/mod.rs`; every test skips when
+//! its fixture is absent.
 
 #![allow(
     clippy::unwrap_used,
@@ -12,26 +12,19 @@
     clippy::indexing_slicing
 )]
 
-use std::path::{Path, PathBuf};
+mod common;
 
-use nimrod::{EntrypointKind, NimBinary, NimVersionHint, rtti::symbols::RttiVersion};
+use common::fixture;
+use nimrod::{NimBinary, NimVersionHint, ProcRole, TypeShape, rtti::symbols::RttiVersion};
 
-fn fixture_path(rel: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(rel)
-}
-
-fn parse_fixture(rel: &str) -> Option<Vec<u8>> {
-    std::fs::read(fixture_path(rel)).ok()
-}
-
+/// The nightly compiler binary (ORC, Nim 2.3.1, x86-64 Linux).
 const NIGHTLY_ELF: &str = "nightly/linux_x64/nim-2.3.1/bin/nim";
 
+/// Every V2 type of the nightly compiler reads (size, alignment, depth), one
+/// per RTTI symbol, with display tokens and destructors resolved.
 #[test]
 fn elf_v2_type_graph_is_fully_readable() {
-    let Some(data) = parse_fixture(NIGHTLY_ELF) else {
-        eprintln!("skip: {NIGHTLY_ELF} not present");
+    let Some(data) = fixture(NIGHTLY_ELF) else {
         return;
     };
     let bin = NimBinary::from_bytes(&data).unwrap();
@@ -72,9 +65,11 @@ fn elf_v2_type_graph_is_fully_readable() {
     assert!(with_dtor > 0, "expected resolved destructors");
 }
 
+/// A V2 display array holds `depth + 1` class tokens, one per inheritance
+/// level including the type itself.
 #[test]
 fn elf_v2_display_tokens_track_depth() {
-    let Some(data) = parse_fixture(NIGHTLY_ELF) else {
+    let Some(data) = fixture(NIGHTLY_ELF) else {
         return;
     };
     let bin = NimBinary::from_bytes(&data).unwrap();
@@ -102,11 +97,11 @@ fn elf_v2_display_tokens_track_depth() {
 }
 
 #[test]
-fn macho_v1_types_degrade_to_name_only() {
-    // V1 globals land in Mach-O __DATA,__common (no file backing, §3.6): they
-    // must surface as name-only shells, never panic, never drop.
-    let Some(data) = parse_fixture("native/exceptions_refc_debug") else {
-        eprintln!("skip: native/exceptions_refc_debug not present");
+fn macho_v1_types_recovered_from_startup_code() {
+    // V1 globals land in Mach-O __DATA,__common (no file backing, §3.6) and
+    // are filled by the `DatInit000` functions, which nimrod evaluates: every
+    // type reads, and the user exception keeps its place in the hierarchy.
+    let Some(data) = fixture("native/exceptions_refc_debug") else {
         return;
     };
     let bin = NimBinary::from_bytes(&data).unwrap();
@@ -114,21 +109,34 @@ fn macho_v1_types_degrade_to_name_only() {
     assert!(!types.is_empty(), "expected V1 RTTI symbols");
     for t in types {
         assert_eq!(t.version, RttiVersion::V1);
-        assert!(!t.is_readable(), "Mach-O V1 should be name-only");
-        // The embedded type fragment is the forensic value that survives.
+        assert!(t.is_readable(), "{} not recovered", t.symbol_name);
+        // The embedded type fragment survives either way.
         assert!(t.type_fragment.is_some());
     }
-    // The user-defined exception types are present by fragment.
-    let frags: Vec<&str> = types
-        .iter()
-        .filter_map(|t| t.type_fragment.as_deref())
-        .collect();
-    assert!(
-        frags.iter().any(|f| f.contains("myerror")),
-        "expected MyError fragment, got {frags:?}"
+    let by_fragment = |f: &str| {
+        types
+            .iter()
+            .position(|t| t.type_fragment.as_deref() == Some(f))
+            .unwrap_or_else(|| panic!("no {f} type"))
+    };
+    let my = &types[by_fragment("myerror")];
+    assert_eq!(my.shape, TypeShape::Object);
+    // refc `Exception`: m_type, parent, name, msg, trace, up.
+    assert_eq!((my.size, my.align), (48, 8));
+    let parent = my.parent.as_ref().and_then(|p| p.index).map(|i| &types[i]);
+    assert_eq!(
+        parent.and_then(|p| p.type_fragment.as_deref()),
+        Some("catchableerror")
+    );
+    let r = &types[by_fragment("refmyerror")];
+    assert_eq!(r.shape, TypeShape::Ref);
+    assert_eq!(
+        r.parent.as_ref().and_then(|p| p.index),
+        Some(by_fragment("myerror"))
     );
 }
 
+/// The version hint tells refc, ARC and ORC apart on the native fixtures.
 #[test]
 fn compiler_version_distinguishes_modes() {
     let cases = [
@@ -137,8 +145,7 @@ fn compiler_version_distinguishes_modes() {
         ("native/exceptions_refc_debug", NimVersionHint::Nim1xRefc),
     ];
     for (rel, expected) in cases {
-        let Some(data) = parse_fixture(rel) else {
-            eprintln!("skip: {rel} not present");
+        let Some(data) = fixture(rel) else {
             continue;
         };
         let bin = NimBinary::from_bytes(&data).unwrap();
@@ -146,30 +153,36 @@ fn compiler_version_distinguishes_modes() {
     }
 }
 
+/// The proc inventory combines shims, init functions and procs, sorted and
+/// deduplicated by address.
 #[test]
-fn code_entrypoints_aggregate_sources() {
-    let Some(data) = parse_fixture(NIGHTLY_ELF) else {
+fn procs_aggregate_sources() {
+    let Some(data) = fixture(NIGHTLY_ELF) else {
         return;
     };
     let bin = NimBinary::from_bytes(&data).unwrap();
-    let eps = bin.code_entrypoints();
-    assert!(!eps.is_empty());
-
-    // VA-sorted and unique.
+    let procs = bin.procs();
+    assert!(!procs.is_empty());
     assert!(
-        eps.windows(2).all(|w| w[0].va < w[1].va),
+        procs.windows(2).all(|w| w[0].va < w[1].va),
         "must be VA-sorted & deduped"
     );
-
-    let has = |k: EntrypointKind| eps.iter().any(|e| e.kind == k);
-    assert!(has(EntrypointKind::EntryShim), "expected entry shims");
-    assert!(has(EntrypointKind::ModuleInit), "expected module inits");
-    assert!(has(EntrypointKind::ProcSymbol), "expected proc symbols");
+    let has = |f: fn(&ProcRole) -> bool| procs.iter().any(|p| f(&p.role));
+    assert!(
+        has(|r| matches!(r, ProcRole::EntryShim(_))),
+        "expected entry shims"
+    );
+    assert!(
+        has(|r| matches!(r, ProcRole::Init(_))),
+        "expected module inits"
+    );
+    assert!(has(|r| *r == ProcRole::User), "expected user procs");
 }
 
+/// Format, bitness and 64-bit predicates of the nightly ELF.
 #[test]
 fn format_and_bitness_predicates() {
-    if let Some(data) = parse_fixture(NIGHTLY_ELF) {
+    if let Some(data) = fixture(NIGHTLY_ELF) {
         let bin = NimBinary::from_bytes(&data).unwrap();
         assert!(bin.format().is_elf());
         assert!(!bin.format().is_pe());

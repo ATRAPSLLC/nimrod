@@ -2,8 +2,8 @@
 //!
 //! A single flat [`Error`] enum covers all failure modes across container
 //! parsing, symbol table access, RTTI recovery, string scanning, and
-//! demangling. Same shape as the `nsis` crate's error enum — intentionally
-//! flat rather than hierarchical.
+//! demangling. It is flat rather than hierarchical: callers match on the
+//! failure, not on which layer produced it.
 
 use core::fmt;
 use std::error;
@@ -15,7 +15,6 @@ pub type Result<T> = core::result::Result<T, Error>;
 ///
 /// Each variant carries enough context for a useful diagnostic message.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Error {
     /// The underlying container parser (`goblin`) failed.
     ///
@@ -24,7 +23,7 @@ pub enum Error {
     /// want on our own error type.
     Goblin(String),
 
-    /// The input bytes are not an ELF, PE, or Mach-O file — or the container
+    /// The input bytes are not an ELF, PE, or Mach-O file - or the container
     /// format is recognised but not one we currently support.
     UnsupportedFormat,
 

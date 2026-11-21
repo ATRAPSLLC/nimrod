@@ -1,14 +1,15 @@
-//! Exception raise-site recovery (phase 1).
+//! Exception type names from read-only data.
 //!
 //! Every `raise` statement in Nim compiles to a call to
 //! `raiseExceptionEx(e, "<TypeName>", "<proc>", "<file>", <line>)`.
 //! All four string arguments are embedded as `.rodata` cstrings
 //! (RESEARCH.md §5.5).
 //!
-//! **Phase 1** (this module) recovers exception type names only, by
-//! scanning rodata for short cstrings matching known Nim exception
-//! naming patterns (`*Error`, `*Defect`, `*Exception`). This is fast
-//! and doesn't require instruction-level analysis.
+//! This module recovers the exception type names only, by scanning rodata
+//! for cstrings matching known Nim exception types and the naming patterns
+//! (`*Error`, `*Defect`, `*Exception`). It needs no instruction analysis
+//! and works on every architecture; [`crate::sites`] decodes the calls
+//! themselves for the full `(type, proc, file, line)` of each raise.
 
 use crate::{
     container::{Container, SectionKind},
@@ -75,25 +76,14 @@ pub fn scan(container: &Container<'_>) -> Vec<ExceptionRef> {
     results
 }
 
+/// Adds the exception type names among `data`'s cstrings to `out`, each
+/// name once (`seen` spans all sections).
 fn scan_section(
     data: &[u8],
     out: &mut Vec<ExceptionRef>,
     seen: &mut std::collections::HashSet<String>,
 ) {
-    let mut offset = 0;
-    while offset < data.len() {
-        let Some(cstr) = util::slice_cstring(data, offset, 256) else {
-            offset = offset.saturating_add(1);
-            continue;
-        };
-
-        if cstr.is_empty() {
-            offset = offset.saturating_add(1);
-            continue;
-        }
-
-        let advance = cstr.len().saturating_add(1);
-
+    for cstr in util::cstrings(data, 256) {
         if let Ok(s) = std::str::from_utf8(cstr)
             && is_exception_type_name(s)
             && seen.insert(s.to_owned())
@@ -102,8 +92,6 @@ fn scan_section(
                 type_name: s.to_owned(),
             });
         }
-
-        offset = offset.saturating_add(advance);
     }
 }
 

@@ -1,15 +1,25 @@
 //! Dump all recoverable Nim artifacts from a single binary.
 //!
+//! Prints the container summary, the detection verdict and compiler hints,
+//! then every scan: entry shims, init functions, RTTI symbols and the type
+//! graph, code entrypoints, string literals, stack-trace data, nimble paths,
+//! exception types, raise sites and the module map, as plain text meant for
+//! reading and diffing.
+//!
 //! Usage:
 //!
 //! ```text
 //! cargo run --example dump -- <path-to-binary>
 //! ```
 
-use std::{env, fs, process};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env, fs, process,
+};
 
-use nimrod::{metadata::GcMode, rtti::symbols::RttiVersion};
+use nimrod::{NimBinary, ProcRole, RelationKind, metadata::GcMode, rtti::symbols::RttiVersion};
 
+/// Parses the binary named on the command line and prints its artifacts.
 fn main() {
     let args: Vec<String> = env::args().collect();
     let Some(path) = args.get(1) else {
@@ -70,6 +80,23 @@ fn main() {
         }
     );
     println!("nim_ver   : {}", bin.nim_version());
+    match bin.mangle_scheme() {
+        Some(scheme) => println!("mangling  : {scheme} (Nim {})", scheme.compiler_range()),
+        None => println!("mangling  : (undetermined)"),
+    }
+    let profile = bin.build_profile();
+    println!(
+        "build     : exceptions={} stack_traces={} runtime_checks={} library={}",
+        profile.exceptions,
+        profile
+            .stack_traces
+            .map_or("unknown", |on| if on { "on" } else { "off" }),
+        profile
+            .runtime_checks
+            .map_or("unknown", |on| if on { "on" } else { "off" }),
+        profile.library,
+    );
+    println!("imports   : {}", bin.container().imports().len());
     if let Some(bits) = bin.bitness() {
         println!("bitness   : {bits}-bit");
     }
@@ -136,6 +163,9 @@ fn main() {
         if !fl.is_empty() {
             line.push_str(&format!(" flags={}", fl.join("|")));
         }
+        if let Some(expr) = &t.type_expr {
+            line.push_str(&format!("  type={expr}"));
+        }
         if !t.is_readable() {
             line.push_str("  (name-only)");
         }
@@ -176,18 +206,35 @@ fn main() {
         }
     }
 
-    let entrypoints = bin.code_entrypoints();
-    if !entrypoints.is_empty() {
+    let procs = bin.procs();
+    if !procs.is_empty() {
         println!();
-        println!("code_entrypoints: {} total", entrypoints.len());
-        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-        for e in entrypoints {
-            let c = counts.entry(e.kind.as_str()).or_default();
+        println!("procs: {} total", procs.len());
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for p in procs {
+            let c = counts.entry(p.role.to_string()).or_default();
             *c = c.saturating_add(1);
         }
-        for (kind, n) in &counts {
-            println!("  {kind}: {n}");
+        for (role, n) in &counts {
+            println!("  {role}: {n}");
         }
+    }
+
+    let relations = bin.relations();
+    if !relations.is_empty() {
+        println!();
+        println!("relations: {} total", relations.len());
+        let mut counts: BTreeMap<(String, &str), usize> = BTreeMap::new();
+        for r in relations {
+            let c = counts
+                .entry((r.kind.to_string(), r.source.as_str()))
+                .or_default();
+            *c = c.saturating_add(1);
+        }
+        for ((kind, source), n) in &counts {
+            println!("  {kind} [{source}]: {n}");
+        }
+        print_startup(&bin);
     }
 
     let harvest = bin.stack_trace();
@@ -327,6 +374,21 @@ fn main() {
         println!("  {:#x}  {display}", lit.payload_addr);
     }
 
+    let v3_literals = bin.string_literals_v3();
+    if !v3_literals.is_empty() {
+        println!();
+        println!("string_literals_v3 (sso): {} found", v3_literals.len());
+        for lit in v3_literals {
+            let shown: String = lit.value.chars().take(77).collect();
+            let more = if shown.len() < lit.value.len() {
+                "..."
+            } else {
+                ""
+            };
+            println!("  {:#x}  {:<6} {shown:?}{more}", lit.addr, lit.kind);
+        }
+    }
+
     let v1_literals = bin.string_literals_v1();
     if !v1_literals.is_empty() {
         println!();
@@ -339,5 +401,78 @@ fn main() {
             };
             println!("  {:#x}  {display}", lit.header_addr);
         }
+    }
+}
+
+/// Prints the startup call structure from `NimMain` down, callees sorted by
+/// name (the binary does not record their order).
+fn print_startup(bin: &NimBinary<'_>) {
+    let mut callees: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    let mut called = BTreeSet::new();
+    for r in bin.relations() {
+        if r.kind == RelationKind::StartupCall {
+            callees.entry(r.from).or_default().push(r.to);
+            called.insert(r.to);
+        }
+    }
+    let roots: Vec<u64> = callees
+        .keys()
+        .copied()
+        .filter(|va| !called.contains(va))
+        .collect();
+    if roots.is_empty() {
+        return;
+    }
+    println!("  startup (callee order not recorded):");
+    let mut seen = BTreeSet::new();
+    for root in roots {
+        print_startup_node(bin, root, 0, &callees, &mut seen);
+    }
+}
+
+/// Prints one startup node and, the first time it is seen, its callees.
+fn print_startup_node(
+    bin: &NimBinary<'_>,
+    va: u64,
+    depth: usize,
+    callees: &BTreeMap<u64, Vec<u64>>,
+    seen: &mut BTreeSet<u64>,
+) {
+    println!(
+        "    {:indent$}{}",
+        "",
+        proc_name(bin, va),
+        indent = depth.saturating_mul(2)
+    );
+    if !seen.insert(va) {
+        return;
+    }
+    let mut next: Vec<(String, u64)> = callees
+        .get(&va)
+        .into_iter()
+        .flatten()
+        .map(|&to| (proc_name(bin, to), to))
+        .collect();
+    next.sort();
+    for (_, to) in next {
+        print_startup_node(bin, to, depth.saturating_add(1), callees, seen);
+    }
+}
+
+/// The inventory name of the proc at `va` (with the kind of an init
+/// function, whose DatInit and Init share the module's name), or the
+/// address.
+fn proc_name(bin: &NimBinary<'_>, va: u64) -> String {
+    let procs = bin.procs();
+    let Some(p) = procs
+        .binary_search_by_key(&va, |p| p.va)
+        .ok()
+        .and_then(|i| procs.get(i))
+    else {
+        return format!("{va:#x}");
+    };
+    match p.role {
+        ProcRole::Init(kind) => format!("{} ({kind})", p.name),
+        _ => p.name.clone(),
     }
 }

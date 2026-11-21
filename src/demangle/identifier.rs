@@ -13,7 +13,7 @@ use std::borrow::Cow;
 /// Substitution table: encoded word → original Nim character.
 ///
 /// Ordered longest-first so that a greedy scan never mismatches a prefix
-/// (e.g. `backslash` before `bar`). From `ccgutils.nim` lines 68–95.
+/// (e.g. `backslash` before `bar`). From `ccgutils.nim` lines 68-95.
 const SUBSTITUTIONS: &[(&str, char)] = &[
     ("backslash", '\\'),
     ("percent", '%'),
@@ -70,8 +70,8 @@ pub fn demangle(mangled: &str) -> Cow<'_, str> {
     if !had_substitutions {
         // Without a trailing `_`, no substitutions were applied, so the
         // string is literal. (Leading-digit escapes are ambiguous without
-        // the trailing `_` context — `X0` could be literal `X0` or
-        // escaped `0` — so we treat everything as literal.)
+        // the trailing `_` context: `X0` could be literal `X0` or
+        // escaped `0`, so we treat everything as literal.)
         return Cow::Borrowed(mangled);
     }
 
@@ -131,7 +131,7 @@ pub fn demangle(mangled: &str) -> Cow<'_, str> {
 
 /// Mangles a Nim identifier using the same rules as `ccgutils.nim proc mangle*`.
 ///
-/// This is the forward direction — primarily useful for round-trip testing
+/// This is the forward direction - primarily useful for round-trip testing
 /// via proptest.
 pub fn mangle(name: &str) -> String {
     let bytes = name.as_bytes();
@@ -206,6 +206,7 @@ pub fn mangle(name: &str) -> String {
     result
 }
 
+/// The uppercase hex digit of `nibble` (Nim's `toHex` alphabet).
 fn to_hex_upper(nibble: u8) -> char {
     match nibble {
         0..=9 => b'0'.wrapping_add(nibble) as char,
@@ -214,6 +215,8 @@ fn to_hex_upper(nibble: u8) -> char {
     }
 }
 
+/// The substitution word `bytes` starts with (`amp`, `plus`, ...) and the
+/// character it stands for, longest word first.
 fn try_substitution(bytes: &[u8]) -> Option<(&'static str, char)> {
     // Greedy longest-first matching. No word-boundary check is needed
     // because the trailing underscore already tells us that substitutions
@@ -221,7 +224,7 @@ fn try_substitution(bytes: &[u8]) -> Option<(&'static str, char)> {
     // longest-first ordering is unambiguous.
     //
     // Edge case: `fooampbar_` is genuinely ambiguous between `foo&|` and
-    // `foo&bar` — the Nim compiler's mangle produces the same output for
+    // `foo&bar` - the Nim compiler's mangle produces the same output for
     // both. We match greedily (same as ESET nimfilt).
     for &(word, ch) in SUBSTITUTIONS {
         if bytes.get(..word.len()) == Some(word.as_bytes()) {
@@ -250,12 +253,14 @@ fn is_mangle_passthrough_or_substitution(b: u8) -> bool {
     )
 }
 
+/// The byte of the two hex digits `hi lo`.
 fn decode_hex2(hi: u8, lo: u8) -> Option<u8> {
     let h = hex_val(hi)?;
     let l = hex_val(lo)?;
     Some((h << 4) | l)
 }
 
+/// The value of hex digit `b`, either case.
 fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b.wrapping_sub(b'0')),

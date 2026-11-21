@@ -15,15 +15,15 @@ use core::fmt;
 /// stable API. Changes are SemVer-major.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShimKind {
-    /// `NimMain` — public initialiser, calls `NimMainInner`.
+    /// `NimMain`: public initialiser, calls `NimMainInner`.
     NimMain,
-    /// `NimMainInner` — runs module init functions.
+    /// `NimMainInner`: runs module init functions.
     NimMainInner,
-    /// `PreMain` — calls `PreMainInner` via volatile pointer.
+    /// `PreMain`: calls `PreMainInner` via volatile pointer.
     PreMain,
-    /// `PreMainInner` — initial setup before module init.
+    /// `PreMainInner`: initial setup before module init.
     PreMainInner,
-    /// `NimMainModule` — init function of the main module.
+    /// `NimMainModule`: init function of the main module.
     NimMainModule,
 }
 
@@ -81,15 +81,12 @@ pub fn scan(container: &Container<'_>) -> Vec<EntryShim> {
     let mut result = Vec::new();
 
     for sym in container.symbols() {
+        // The container layer removes C-level name decoration (Mach-O and
+        // 32-bit Windows `_`, fastcall `@N`), so names compare as declared.
         let name = sym.name.as_ref();
-        // Strip leading underscore (Mach-O C-level symbols already have
-        // it stripped by the container layer, but COFF entries may retain
-        // one).
-        let stripped = name.strip_prefix('_').unwrap_or(name);
 
         for &(suffix, kind) in SHIM_NAMES {
-            if stripped == suffix || stripped.ends_with(suffix) && is_prefix_match(stripped, suffix)
-            {
+            if name == suffix || name.ends_with(suffix) && is_prefix_match(name, suffix) {
                 result.push(EntryShim {
                     kind,
                     symbol_name: name.to_string(),
@@ -103,7 +100,7 @@ pub fn scan(container: &Container<'_>) -> Vec<EntryShim> {
     result
 }
 
-/// Checks that a symbol is `<prefix>NimMain` etc. — the prefix must be
+/// Checks that a symbol is `<prefix>NimMain` etc. - the prefix must be
 /// non-empty and not contain `__` (which would indicate a normal Nim
 /// function, not a shim).
 fn is_prefix_match(symbol: &str, suffix: &str) -> bool {
@@ -113,7 +110,7 @@ fn is_prefix_match(symbol: &str, suffix: &str) -> bool {
     if prefix.is_empty() {
         return false;
     }
-    // A nimMainPrefix is a short identifier — no double underscores.
+    // A nimMainPrefix is a short identifier - no double underscores.
     !prefix.contains("__")
 }
 
@@ -123,11 +120,9 @@ fn is_prefix_match(symbol: &str, suffix: &str) -> bool {
 /// `Some(prefix)` if a shared non-empty prefix is found across all shims,
 /// or `None` if no shims were located.
 pub fn detect_prefix(shims: &[EntryShim]) -> Option<&str> {
-    // Find the NimMain shim — its prefix is authoritative.
+    // Find the NimMain shim: its prefix is authoritative.
     let nim_main = shims.iter().find(|s| s.kind == ShimKind::NimMain)?;
-    let name = nim_main.symbol_name.as_str();
-    let stripped = name.strip_prefix('_').unwrap_or(name);
-    let prefix = stripped.strip_suffix("NimMain")?;
+    let prefix = nim_main.symbol_name.strip_suffix("NimMain")?;
     Some(prefix)
 }
 
@@ -158,7 +153,7 @@ mod tests {
 
     #[test]
     fn prefix_match_rejects_exact() {
-        // Exact match (prefix length 0) — is_prefix_match returns false,
+        // Exact match (prefix length 0) - is_prefix_match returns false,
         // but the caller checks exact match first via `==`.
         assert!(!is_prefix_match("NimMain", "NimMain"));
     }

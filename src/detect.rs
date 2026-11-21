@@ -2,12 +2,12 @@
 //!
 //! Detection runs in two single-pass phases:
 //!
-//! 1. **Symbol scan** — one walk of the symbol table classifies every
+//! 1. **Symbol scan**: one walk of the symbol table classifies every
 //!    symbol against all symbol-based probes (entry shims, init functions,
 //!    RTTI globals, `.nim` file markers). This is cheap: string comparisons
 //!    on a pre-parsed list.
 //!
-//! 2. **Rodata scan** — one walk of the read-only sections tests byte-string
+//! 2. **Rodata scan**: one walk of the read-only sections tests byte-string
 //!    needles via `memchr::memmem`. This is the more expensive phase (substring
 //!    search over potentially hundreds of KB), so it runs second.
 //!
@@ -175,9 +175,9 @@ impl DetectionReport {
     ///
     /// Two phases, each a single pass over its data source:
     ///
-    /// 1. **Symbol scan** — one walk of the symbol table classifies every
+    /// 1. **Symbol scan**: one walk of the symbol table classifies every
     ///    symbol against all symbol-based probes simultaneously.
-    /// 2. **Rodata scan** — one walk of the read-only sections tests every
+    /// 2. **Rodata scan**: one walk of the read-only sections tests every
     ///    byte-string needle.
     ///
     /// Both phases exit early when their respective flag sets are saturated.
@@ -192,6 +192,9 @@ impl DetectionReport {
     }
 }
 
+/// Symbols of the C entry shims the Nim backend emits in every program
+/// (`NimMain`, `PreMain` and their inner halves): any one present sets
+/// [`DetectionMatches::NIMMAIN_SYMBOL`].
 const ENTRY_SHIM_NAMES: &[&str] = &[
     "NimMain",
     "NimMainInner",
@@ -216,7 +219,7 @@ fn probe_symbols(c: &Container<'_>) -> DetectionMatches {
     // STT_FILE / COFF `.file` records only exist in ELF and PE.
     let check_file = c.format() == Format::Elf || c.format() == Format::Pe;
 
-    // The maximum set of flags this pass can produce — used for early exit.
+    // The maximum set of flags this pass can produce - used for early exit.
     let ceiling = if check_file {
         DetectionMatches(SYMBOL_FLAGS_COMMON.0 | DetectionMatches::STT_FILE_DOT_NIM.0)
     } else {
@@ -227,9 +230,8 @@ fn probe_symbols(c: &Container<'_>) -> DetectionMatches {
         let name = sym.name.as_ref();
 
         if !m.contains(DetectionMatches::NIMMAIN_SYMBOL) {
-            let stripped = name.strip_prefix('_').unwrap_or(name);
             for &probe in ENTRY_SHIM_NAMES {
-                if stripped == probe {
+                if name == probe {
                     m |= DetectionMatches::NIMMAIN_SYMBOL;
                     break;
                 }
@@ -298,6 +300,12 @@ const RODATA_NEEDLES: &[(&[u8], DetectionMatches)] = &[
     (b"@[[reraised from:", DetectionMatches::NIM_SIGNAL_STRINGS),
 ];
 
+/// Runtime error messages as they sit in a string literal: the leading `@` is
+/// the top byte (`0x40`) of the little-endian capacity word with
+/// `NIM_STRLIT_FLAG` set, just before the text. Two hits set
+/// [`DetectionMatches::NIM_ERROR_STRINGS`]. Big-endian images store that byte
+/// first in the word, so these needles do not match there; the other probes
+/// still detect them.
 const ERROR_NEEDLES: &[&[u8]] = &[
     b"@value out of range",
     b"@division by zero",
